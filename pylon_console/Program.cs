@@ -11,9 +11,8 @@ using System.Threading.Tasks;
 
 internal static class Libzt
 {
-    private const string DLL = "libzt.dll"; // 你的文件名
+    private const string DLL = "libzt.dll";
 
-    // ---- init / node / net ----
     [DllImport(DLL, CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Ansi)]
     public static extern int zts_init_from_storage(string path);
 
@@ -35,14 +34,12 @@ internal static class Libzt
     [DllImport(DLL, CallingConvention = CallingConvention.Cdecl)]
     public static extern void zts_util_delay(uint ms);
 
-    // ---- sockets ----
     public const int ZTS_AF_INET = 2;
     public const int ZTS_SOCK_STREAM = 1;
 
     [DllImport(DLL, CallingConvention = CallingConvention.Cdecl)]
     public static extern int zts_socket(int family, int type, int protocol);
 
-    // pylon: zts_connect(fd, ipstr, port, timeout_s)
     [DllImport(DLL, CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Ansi)]
     public static extern int zts_connect(int fd, string addr, ushort port, int timeoutSeconds);
 
@@ -62,11 +59,15 @@ internal sealed class Socks5Server
     private readonly int _listenPort;
     private readonly int _connectTimeoutSeconds;
 
-    public Socks5Server(IPAddress listenIp, int listenPort, int connectTimeoutSeconds = 10)
+    // 可选：限制最大并发连接数，避免线程池被打爆
+    private readonly SemaphoreSlim _connLimit;
+
+    public Socks5Server(IPAddress listenIp, int listenPort, int connectTimeoutSeconds = 10, int maxConcurrentClients = 512)
     {
         _listenIp = listenIp;
         _listenPort = listenPort;
         _connectTimeoutSeconds = connectTimeoutSeconds;
+        _connLimit = new SemaphoreSlim(maxConcurrentClients, maxConcurrentClients);
     }
 
     public void Run()
@@ -79,7 +80,22 @@ internal sealed class Socks5Server
         {
             var client = listener.AcceptTcpClient();
             client.NoDelay = true;
-            Task.Run(() => HandleClient(client));
+
+            // 多客户端并发：每个连接一个任务
+            Task.Run(() => HandleClientWithLimit(client));
+        }
+    }
+
+    private void HandleClientWithLimit(TcpClient client)
+    {
+        _connLimit.Wait();
+        try
+        {
+            HandleClient(client);
+        }
+        finally
+        {
+            _connLimit.Release();
         }
     }
 
@@ -91,6 +107,8 @@ internal sealed class Socks5Server
             cs.ReadTimeout = Timeout.Infinite;
             cs.WriteTimeout = Timeout.Infinite;
 
+            int zfd = -1;
+
             try
             {
                 // ---- GREETING ----
@@ -99,10 +117,9 @@ internal sealed class Socks5Server
 
                 int nMethods = cs.ReadByte();
                 if (nMethods <= 0) return;
-                ReadExact(cs, nMethods); // methods list, ignore
+                ReadExact(cs, nMethods); // ignore methods
 
-                // reply: NO AUTH (0x00)
-                cs.Write(new byte[] { 0x05, 0x00 }, 0, 2);
+                cs.Write(new byte[] { 0x05, 0x00 }, 0, 2); // NO AUTH
 
                 // ---- REQUEST ----
                 byte[] hdr = ReadExact(cs, 4); // VER CMD RSV ATYP
@@ -132,18 +149,17 @@ internal sealed class Socks5Server
                     byte[] hb = ReadExact(cs, len);
                     host = Encoding.ASCII.GetString(hb);
 
-                    // simple resolve: prefer IPv4
                     var addrs = Dns.GetHostAddresses(host);
                     dstIp = Array.Find(addrs, a => a.AddressFamily == AddressFamily.InterNetwork);
                     if (dstIp == null)
                     {
-                        Reply(cs, rep: 0x08); // address type not supported / no suitable address
+                        Reply(cs, rep: 0x08);
                         return;
                     }
                 }
                 else
                 {
-                    Reply(cs, rep: 0x08); // ATYP not supported
+                    Reply(cs, rep: 0x08);
                     return;
                 }
 
@@ -153,74 +169,92 @@ internal sealed class Socks5Server
                 Console.WriteLine($"CONNECT {host}:{dstPort} -> {dstIp}");
 
                 // ---- CONNECT via libzt ----
-                int zfd = Libzt.zts_socket(Libzt.ZTS_AF_INET, Libzt.ZTS_SOCK_STREAM, 0);
+                zfd = Libzt.zts_socket(Libzt.ZTS_AF_INET, Libzt.ZTS_SOCK_STREAM, 0);
                 if (zfd < 0)
                 {
-                    Reply(cs, rep: 0x01); // general failure
+                    Reply(cs, rep: 0x01);
                     return;
                 }
 
-                try
+                int rc = Libzt.zts_connect(zfd, dstIp.ToString(), (ushort)dstPort, _connectTimeoutSeconds);
+                if (rc < 0)
                 {
-                    int rc = Libzt.zts_connect(zfd, dstIp.ToString(), (ushort)dstPort, _connectTimeoutSeconds);
-                    if (rc < 0)
-                    {
-                        Reply(cs, rep: 0x05); // connection refused / general failure
-                        return;
-                    }
-
-                    // success reply (BND.ADDR/PORT set to 0.0.0.0:0)
-                    Reply(cs, rep: 0x00);
-
-                    // ---- RELAY ----
-                    Relay(cs, zfd);
+                    Reply(cs, rep: 0x05);
+                    return;
                 }
-                finally
+
+                Reply(cs, rep: 0x00); // success
+
+                // ---- RELAY ----
+                Relay(client, cs, zfd);
+            }
+            catch (IOException)
+            {
+                // disconnected
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine("Client error: " + ex);
+            }
+            finally
+            {
+                if (zfd >= 0)
                 {
                     try { Libzt.zts_close(zfd); } catch { }
                 }
             }
-            catch (IOException)
-            {
-                // client disconnected
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine("Client error: " + ex.Message);
-            }
         }
     }
 
-    private static void Relay(NetworkStream clientStream, int zfd)
+    private static void Relay(TcpClient client, NetworkStream clientStream, int zfd)
     {
         var cts = new CancellationTokenSource();
+
         var t1 = Task.Run(() => ClientToZt(clientStream, zfd, cts.Token));
         var t2 = Task.Run(() => ZtToClient(clientStream, zfd, cts.Token));
 
         Task.WaitAny(t1, t2);
+
+        // 触发双方尽快退出（打断阻塞读）
         cts.Cancel();
-        // give a moment to unwind
+        try { client.Client.Shutdown(SocketShutdown.Both); } catch { }
+        try { client.Close(); } catch { }
+        try { Libzt.zts_close(zfd); } catch { }
+
         Task.WaitAll(new[] { t1, t2 }, millisecondsTimeout: 2000);
     }
 
     private static void ClientToZt(NetworkStream cs, int zfd, CancellationToken ct)
     {
         byte[] buf = new byte[16 * 1024];
+
         while (!ct.IsCancellationRequested)
         {
-            int n = cs.Read(buf, 0, buf.Length);
+            int n;
+            try
+            {
+                n = cs.Read(buf, 0, buf.Length);
+            }
+            catch
+            {
+                break;
+            }
+
             if (n <= 0) break;
 
             int off = 0;
             while (off < n && !ct.IsCancellationRequested)
             {
-                // zts_write returns bytes written or <0
-                int w = Libzt.zts_write(zfd, buf, n);
-                // NOTE: some libzt builds may not support partial-write semantics the same way;
-                // if yours does, we should pass offset+len. zts_write signature here doesn't have offset.
-                // For correctness, we can copy slice; simplest: assume writes full 'n' or fails.
-                if (w < 0) return;
-                off = n;
+                // libzt 的 zts_write 没有 offset 参数，所以需要拷贝 slice
+                int chunkLen = n - off;
+                byte[] chunk = new byte[chunkLen];
+                Buffer.BlockCopy(buf, off, chunk, 0, chunkLen);
+
+                int w = Libzt.zts_write(zfd, chunk, chunkLen);
+                if (w <= 0) return;
+
+                // 如果发生部分写入（w < chunkLen），继续发送剩余部分
+                off += w;
             }
         }
     }
@@ -228,12 +262,21 @@ internal sealed class Socks5Server
     private static void ZtToClient(NetworkStream cs, int zfd, CancellationToken ct)
     {
         byte[] buf = new byte[16 * 1024];
+
         while (!ct.IsCancellationRequested)
         {
             int r = Libzt.zts_read(zfd, buf, buf.Length);
             if (r <= 0) break;
-            cs.Write(buf, 0, r);
-            cs.Flush();
+
+            try
+            {
+                cs.Write(buf, 0, r);
+                // 一般不需要 Flush；NetworkStream 对 TCP 会直接发
+            }
+            catch
+            {
+                break;
+            }
         }
     }
 
@@ -250,8 +293,6 @@ internal sealed class Socks5Server
         return b;
     }
 
-    // SOCKS5 reply:
-    // VER REP RSV ATYP BND.ADDR BND.PORT
     private static void Reply(Stream s, byte rep)
     {
         byte[] resp = new byte[10];
@@ -259,7 +300,6 @@ internal sealed class Socks5Server
         resp[1] = rep;
         resp[2] = 0x00;
         resp[3] = 0x01; // IPv4
-        // BND.ADDR = 0.0.0.0, BND.PORT=0
         s.Write(resp, 0, resp.Length);
     }
 }
@@ -280,43 +320,23 @@ internal static class Program
         IPAddress listenIp = IPAddress.Parse(args[2]);
         int listenPort = int.Parse(args[3]);
 
-        // ---- init node ----
         int err = Libzt.zts_init_from_storage(configPath);
-        if (err < 0)
-        {
-            Console.WriteLine($"zts_init_from_storage failed: {err}");
-            return 2;
-        }
+        if (err < 0) { Console.WriteLine($"zts_init_from_storage failed: {err}"); return 2; }
 
         err = Libzt.zts_node_start();
-        if (err < 0)
-        {
-            Console.WriteLine($"zts_node_start failed: {err}");
-            return 3;
-        }
+        if (err < 0) { Console.WriteLine($"zts_node_start failed: {err}"); return 3; }
 
         Console.WriteLine("Waiting for node online...");
-        while (Libzt.zts_node_is_online() == 0)
-        {
-            Libzt.zts_util_delay(50);
-        }
+        while (Libzt.zts_node_is_online() == 0) Libzt.zts_util_delay(50);
         Console.WriteLine($"Node ID: {Libzt.zts_node_get_id():x}");
 
         Console.WriteLine($"Joining network {netId:x} ...");
         err = Libzt.zts_net_join(netId);
-        if (err < 0)
-        {
-            Console.WriteLine($"zts_net_join failed: {err}");
-            return 4;
-        }
+        if (err < 0) { Console.WriteLine($"zts_net_join failed: {err}"); return 4; }
 
         Console.WriteLine("Waiting for network transport ready...");
-        while (Libzt.zts_net_transport_is_ready(netId) == 0)
-        {
-            Libzt.zts_util_delay(50);
-        }
+        while (Libzt.zts_net_transport_is_ready(netId) == 0) Libzt.zts_util_delay(50);
 
-        // ---- run socks5 ----
         new Socks5Server(listenIp, listenPort).Run();
         return 0;
     }
