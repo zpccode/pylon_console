@@ -1,3 +1,4 @@
 <Solution>
   <Project Path="pylon_console/pylon_console.csproj" Id="b5275089-ee8d-4e25-9c59-04624c5a840f" />
+  <Project Path="ZtGatewayForwarder/ZtGatewayForwarder.csproj" Id="09113b80-eea8-45ed-bb3e-3db1db90b449" />
 </Solution>
